@@ -8,6 +8,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <StartupObject>UpdateBuilder.Program</StartupObject>
     <SignAssembly>False</SignAssembly>
+    <Copyright>John Mayhem (c) 2023</Copyright>
+    <RepositoryUrl>https://github.com/john-mayhem/UpdateBuilder</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <NeutralLanguage>en</NeutralLanguage>
   </PropertyGroup>
 
 </Project>
