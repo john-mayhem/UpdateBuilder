@@ -22,16 +22,16 @@ jobs:
         dotnet-version: 8.0.x
 
     - name: Restore dependencies
-      run: dotnet restore
+      run: dotnet restore UpdateBuilder.csproj
 
     - name: Build
-      run: dotnet build --configuration Release --no-restore
+      run: dotnet build UpdateBuilder.csproj --configuration Release --no-restore
 
     - name: Publish win-x64
-      run: dotnet publish --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true --output ./publish/win-x64
+      run: dotnet publish UpdateBuilder.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true --output ./publish/win-x64
 
     - name: Publish win-x86
-      run: dotnet publish --configuration Release --runtime win-x86 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true --output ./publish/win-x86
+      run: dotnet publish UpdateBuilder.csproj --configuration Release --runtime win-x86 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true --output ./publish/win-x86
 
     - name: Create zip archives
       run: |
@@ -64,13 +64,13 @@ jobs:
         dotnet-version: 8.0.x
 
     - name: Restore dependencies
-      run: dotnet restore
+      run: dotnet restore UpdateBuilder.csproj
 
     - name: Publish win-x64
-      run: dotnet publish --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true --output ./publish/win-x64
+      run: dotnet publish UpdateBuilder.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true --output ./publish/win-x64
 
     - name: Publish win-x86
-      run: dotnet publish --configuration Release --runtime win-x86 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true --output ./publish/win-x86
+      run: dotnet publish UpdateBuilder.csproj --configuration Release --runtime win-x86 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true --output ./publish/win-x86
 
     - name: Create zip archives
       run: |
