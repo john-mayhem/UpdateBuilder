@@ -1,33 +1,76 @@
 using System;
 using System.Windows.Forms;
 using System.IO;
-using System.ComponentModel;
 using System.Threading.Tasks;
-using System.Text;
-using System.Linq;
-using System.Collections.Concurrent;
+using System.IO.Compression;
+using Microsoft.Extensions.Configuration;
+using UpdateBuilder.Models;
+using UpdateBuilder.Services;
+using Serilog;
 
 namespace UpdateBuilder
 {
     public partial class MainForm : Form
     {
-        private readonly BackgroundWorker _backgroundWorker;
+        private readonly UpdatePackageBuilder _packageBuilder;
+        private readonly BuildConfiguration _config;
+        private CancellationTokenSource? _cancellationTokenSource;
 
         public MainForm()
         {
             InitializeComponent();
-            _backgroundWorker = new BackgroundWorker
+            _packageBuilder = new UpdatePackageBuilder();
+            _config = LoadConfiguration();
+        }
+
+        private BuildConfiguration LoadConfiguration()
+        {
+            try
             {
-                WorkerReportsProgress = true,
-                WorkerSupportsCancellation = true
-            };
-            _backgroundWorker.DoWork += BackgroundWorker_DoWork;
-            _backgroundWorker.ProgressChanged += BackgroundWorker_ProgressChanged;
-            _backgroundWorker.RunWorkerCompleted += BackgroundWorker_RunWorkerCompleted;
+                string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
+
+                if (!File.Exists(configPath))
+                {
+                    Log.Warning("Configuration file not found, using defaults");
+                    return new BuildConfiguration();
+                }
+
+                var configuration = new ConfigurationBuilder()
+                    .AddJsonFile(configPath, optional: true)
+                    .Build();
+
+                var config = new BuildConfiguration
+                {
+                    ExcludedExtensions = configuration.GetSection("ExcludedExtensions").Get<List<string>>() ?? [],
+                    ExcludedFolders = configuration.GetSection("ExcludedFolders").Get<List<string>>() ?? [],
+                    MaxProductNameLength = int.TryParse(configuration["MaxProductNameLength"], out int maxLen) ? maxLen : 32
+                };
+
+                // Set default compression level from config
+                if (Enum.TryParse<CompressionLevel>(configuration["DefaultCompressionLevel"], out var compressionLevel))
+                {
+                    cmbCompressionLevel.SelectedItem = compressionLevel.ToString();
+                }
+
+                Log.Information("Configuration loaded successfully");
+                return config;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to load configuration, using defaults");
+                return new BuildConfiguration();
+            }
         }
 
         private void MainForm_Load(object sender, EventArgs e)
         {
+            // Initialize compression level dropdown
+            cmbCompressionLevel.Items.Clear();
+            cmbCompressionLevel.Items.Add(CompressionLevel.Optimal.ToString());
+            cmbCompressionLevel.Items.Add(CompressionLevel.Fastest.ToString());
+            cmbCompressionLevel.Items.Add(CompressionLevel.NoCompression.ToString());
+            cmbCompressionLevel.SelectedIndex = 0;
+
             UpdateStartButtonState();
         }
 
@@ -55,7 +98,8 @@ namespace UpdateBuilder
         private void UpdateStartButtonState()
         {
             btnProcess.Enabled = !string.IsNullOrWhiteSpace(txtInputDirectory.Text) &&
-                                 !string.IsNullOrWhiteSpace(txtDestinationFolder.Text);
+                                 !string.IsNullOrWhiteSpace(txtDestinationFolder.Text) &&
+                                 _cancellationTokenSource == null;
         }
 
         private async void BtnProcess_Click(object sender, EventArgs e)
@@ -63,19 +107,73 @@ namespace UpdateBuilder
             if (!ValidateInputs())
                 return;
 
-            btnProcess.Enabled = false;
             try
             {
-                await ProcessFilesAsync();
+                _cancellationTokenSource = new CancellationTokenSource();
+                btnProcess.Enabled = false;
+                btnCancel.Enabled = true;
+
+                Log.Information("Starting build process");
+
+                var compressionLevel = Enum.Parse<CompressionLevel>(cmbCompressionLevel.SelectedItem?.ToString() ?? "Optimal");
+                var progress = new Progress<BuildProgress>(UpdateProgress);
+
+                string version = chkAutoIncrement.Checked
+                    ? await UpdatePackageBuilder.GetNextVersionAsync(txtDestinationFolder.Text)
+                    : txtNewVersion.Text;
+
+                var package = await UpdatePackageBuilder.BuildPackageAsync(
+                    txtInputDirectory.Text,
+                    txtDestinationFolder.Text,
+                    txtProductName.Text,
+                    version,
+                    compressionLevel,
+                    _config,
+                    progress,
+                    _cancellationTokenSource.Token);
+
+                txtNewVersion.Text = package.Version;
+                MessageBox.Show(
+                    $"Package built successfully!\n\n" +
+                    $"Files: {package.Files.Count}\n" +
+                    $"Packed Size: {FormatBytes(package.TotalPackedSize)}\n" +
+                    $"Unpacked Size: {FormatBytes(package.TotalUnpackedSize)}\n" +
+                    $"Compression Ratio: {(package.TotalUnpackedSize > 0 ? (100.0 - (package.TotalPackedSize * 100.0 / package.TotalUnpackedSize)) : 0):F1}%",
+                    "Success",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+
+                Log.Information("Build process completed successfully");
+            }
+            catch (OperationCanceledException)
+            {
+                MessageBox.Show("Operation cancelled by user.", "Cancelled", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Log.Information("Build process cancelled by user");
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"An error occurred: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                LogMessage($"Error: {ex}");
+                Log.Error(ex, "Build process failed");
             }
             finally
             {
+                _cancellationTokenSource?.Dispose();
+                _cancellationTokenSource = null;
                 btnProcess.Enabled = true;
+                btnCancel.Enabled = false;
+                overallProgressBar.Value = 0;
+                lblCurrentFile.Text = string.Empty;
+                UpdateStartButtonState();
+            }
+        }
+
+        private void BtnCancel_Click(object sender, EventArgs e)
+        {
+            if (_cancellationTokenSource != null)
+            {
+                Log.Information("Cancellation requested");
+                _cancellationTokenSource.Cancel();
+                btnCancel.Enabled = false;
             }
         }
 
@@ -93,10 +191,34 @@ namespace UpdateBuilder
                 return false;
             }
 
+            if (string.IsNullOrWhiteSpace(txtProductName.Text))
+            {
+                MessageBox.Show("Product name is required.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+
+            if (txtProductName.Text.Length > _config.MaxProductNameLength)
+            {
+                MessageBox.Show(
+                    $"Product name exceeds maximum length of {_config.MaxProductNameLength} characters.\n" +
+                    $"Current length: {txtProductName.Text.Length}",
+                    "Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return false;
+            }
+
+            if (!chkAutoIncrement.Checked && !Version.TryParse(txtNewVersion.Text, out _))
+            {
+                MessageBox.Show("Invalid version format. Please use format like: 1.0.0", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+
             try
             {
-                File.Create(Path.Combine(txtDestinationFolder.Text, "test.txt")).Close();
-                File.Delete(Path.Combine(txtDestinationFolder.Text, "test.txt"));
+                string testFile = Path.Combine(txtDestinationFolder.Text, "test.txt");
+                File.Create(testFile).Close();
+                File.Delete(testFile);
             }
             catch
             {
@@ -107,159 +229,38 @@ namespace UpdateBuilder
             return true;
         }
 
-        private async Task ProcessFilesAsync()
-        {
-            string destinationFolder = txtDestinationFolder.Text;
-            ClearOutputDirectory(destinationFolder);
-            string inputDirectory = txtInputDirectory.Text;
-            string fileListPath = Path.Combine(destinationFolder, "filelist.bin");
-
-            string[] files = Directory.GetFiles(inputDirectory, "*", SearchOption.AllDirectories);
-
-            var fileInfo = new ConcurrentDictionary<string, (string Hash, long Size)>();
-            int totalFiles = files.Length;
-            int filesProcessed = 0;
-            long totalUnpackedSize = 0;
-            long totalPackedSize = 0;
-
-            await Task.Run(async () =>
-            {
-                await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, async (file, token) =>
-                {
-                    string relativePath = file[(inputDirectory.Length + 1)..];
-                    string hash = await FileUtils.CalculateFileHashAsync(file);
-                    long fileSize = new FileInfo(file).Length;
-                    fileInfo[relativePath.Replace("\\", "/")] = (hash, fileSize);
-
-                    string archivePath = Path.Combine(destinationFolder, relativePath.Replace("\\", "/") + ".zip");
-                    await FileUtils.ArchiveFileAsync(file, archivePath);
-
-                    Interlocked.Add(ref totalUnpackedSize, fileSize);
-                    Interlocked.Add(ref totalPackedSize, new FileInfo(archivePath).Length);
-
-                    int processed = Interlocked.Increment(ref filesProcessed);
-                    int progress = (int)((double)processed / totalFiles * 100);
-                    ReportProgress(progress, progress);
-                });
-            });
-
-            string updateVersion = GetUpdateVersion(destinationFolder);
-            txtNewVersion.Text = updateVersion; // Update this line
-
-            var fileListContent = new StringBuilder();
-
-            // Add system information
-            fileListContent.AppendLine(DateTime.Now.ToString("dd.MM.yyyy - HH:mm:ss"));
-            fileListContent.AppendLine(txtProductName.Text[..Math.Min(txtProductName.Text.Length, 32)]);
-            fileListContent.AppendLine(updateVersion);
-            fileListContent.AppendLine($"{totalPackedSize}/{totalUnpackedSize}");
-            for (int i = 4; i < 10; i++)
-            {
-                fileListContent.AppendLine("");
-            }
-
-            // Add file information
-            foreach (var kvp in fileInfo.OrderBy(kvp => kvp.Key))
-            {
-                fileListContent.AppendLine($"{kvp.Value.Hash} {kvp.Value.Size,20} {kvp.Key}");
-            }
-
-            // Encode and write to file
-            byte[] encodedContent = EncodeFileList(fileListContent.ToString());
-            await File.WriteAllBytesAsync(fileListPath, encodedContent);
-
-            LogMessage("Process completed successfully.");
-        }
-
-        private string GetUpdateVersion(string destinationFolder)
-        {
-            if (!string.IsNullOrWhiteSpace(txtNewVersion.Text))
-            {
-                return txtNewVersion.Text;
-            }
-
-            string existingFileList = Path.Combine(destinationFolder, "filelist.bin");
-            if (File.Exists(existingFileList))
-            {
-                byte[] encodedContent = File.ReadAllBytes(existingFileList);
-                string decodedContent = DecodeFileList(encodedContent);
-                string[] lines = decodedContent.Split('\n');
-                if (lines.Length > 2 && Version.TryParse(lines[2].Trim(), out Version? existingVersion) && existingVersion != null)
-                {
-                    return new Version(existingVersion!.Major, existingVersion.Minor, existingVersion.Build + 1).ToString();
-                }
-            }
-
-            return "0.0.1";
-        }
-
-        private static byte[] EncodeFileList(string content)
-        {
-            // Simple XOR encoding for demonstration. Replace with a more secure method in production.
-            byte[] bytes = Encoding.UTF8.GetBytes(content);
-            for (int i = 0; i < bytes.Length; i++)
-            {
-                bytes[i] = (byte)(bytes[i] ^ 0xAA);
-            }
-            return bytes;
-        }
-
-        private static string DecodeFileList(byte[] encodedContent)
-        {
-            // Corresponding decoding method
-            for (int i = 0; i < encodedContent.Length; i++)
-            {
-                encodedContent[i] = (byte)(encodedContent[i] ^ 0xAA);
-            }
-            return Encoding.UTF8.GetString(encodedContent);
-        }
-
-        private void ReportProgress(int perFileProgress, int overallProgress)
+        private void UpdateProgress(BuildProgress progress)
         {
             if (InvokeRequired)
             {
-                Invoke(new Action(() => ReportProgress(perFileProgress, overallProgress)));
+                Invoke(new Action(() => UpdateProgress(progress)));
                 return;
             }
 
-            perFileProgressBar.Value = Math.Min(perFileProgress, perFileProgressBar.Maximum);
-            overallProgressBar.Value = Math.Min(overallProgress, overallProgressBar.Maximum);
+            overallProgressBar.Value = Math.Min(progress.PercentComplete, overallProgressBar.Maximum);
+            lblCurrentFile.Text = $"Processing: {progress.CurrentFile}";
         }
 
-        private static void LogMessage(string message)
-        {
-            string logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "log.txt");
-            string logMessage = $"{DateTime.Now}: {message}";
-            File.AppendAllText(logFilePath, logMessage + Environment.NewLine);
-        }
-
-        // BackgroundWorker event handlers (if needed for future use)
-        private void BackgroundWorker_DoWork(object? sender, DoWorkEventArgs e) { }
-        private void BackgroundWorker_ProgressChanged(object? sender, ProgressChangedEventArgs e) { }
-        private void BackgroundWorker_RunWorkerCompleted(object? sender, RunWorkerCompletedEventArgs e) { }
-
-
-        private void UpdateVersionFromExistingFilelist(string destinationFolder)
+        private async void UpdateVersionFromExistingFilelist(string destinationFolder)
         {
             string fileListPath = Path.Combine(destinationFolder, "filelist.bin");
             if (File.Exists(fileListPath))
             {
-                byte[] encodedContent = File.ReadAllBytes(fileListPath);
-                string decodedContent = DecodeFileList(encodedContent);
-                string[] lines = decodedContent.Split('\n');
-                if (lines.Length > 2)
+                _ = new FileListManager();
+                var package = await FileListManager.ReadFileListAsync(fileListPath);
+
+                if (package != null)
                 {
-                    txtProductName.Text = lines[1].Trim();  // Set product name
-                    string currentVersion = lines[2].Trim();
-                    txtCurrentVersion.Text = currentVersion;
-                    txtNewVersion.Text = currentVersion;
+                    txtProductName.Text = package.ProductName;
+                    txtCurrentVersion.Text = package.Version;
+                    txtNewVersion.Text = package.Version;
                     chkAutoIncrement.Enabled = true;
                 }
             }
             else
             {
                 txtCurrentVersion.Text = string.Empty;
-                txtNewVersion.Text = "0.1";
+                txtNewVersion.Text = "0.0.1";
                 chkAutoIncrement.Checked = false;
                 chkAutoIncrement.Enabled = false;
             }
@@ -278,7 +279,7 @@ namespace UpdateBuilder
                 txtNewVersion.ReadOnly = true;
                 if (Version.TryParse(txtCurrentVersion.Text, out Version? currentVersion))
                 {
-                    if (currentVersion.Build == -1)  // This means it's a 2-part version (e.g., 0.2)
+                    if (currentVersion.Build == -1)
                     {
                         txtNewVersion.Text = new Version(currentVersion.Major, currentVersion.Minor + 1).ToString();
                     }
@@ -293,7 +294,7 @@ namespace UpdateBuilder
                 txtNewVersion.ReadOnly = false;
                 if (string.IsNullOrEmpty(txtCurrentVersion.Text))
                 {
-                    txtNewVersion.Text = "0.1";
+                    txtNewVersion.Text = "0.0.1";
                 }
                 else
                 {
@@ -302,21 +303,17 @@ namespace UpdateBuilder
             }
         }
 
-
-        private static void ClearOutputDirectory(string directory)
+        private static string FormatBytes(long bytes)
         {
-            foreach (string file in Directory.GetFiles(directory))
+            string[] sizes = ["B", "KB", "MB", "GB"];
+            double len = bytes;
+            int order = 0;
+            while (len >= 1024 && order < sizes.Length - 1)
             {
-                if (!string.Equals(Path.GetFileName(file), "filelist.bin", StringComparison.OrdinalIgnoreCase))
-                {
-                    File.Delete(file);
-                }
+                order++;
+                len /= 1024;
             }
-            foreach (string dir in Directory.GetDirectories(directory))
-            {
-                Directory.Delete(dir, true);
-            }
+            return $"{len:0.##} {sizes[order]}";
         }
     }
-
 }
